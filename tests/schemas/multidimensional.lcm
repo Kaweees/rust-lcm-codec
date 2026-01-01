@@ -1,0 +1,20 @@
+package multidimensional;
+
+struct matrix2d_t
+{
+    int32_t rows;
+    int32_t cols;
+    double matrix[rows][cols];
+}
+
+struct static_matrix2d_t
+{
+    double matrix[3][4];
+}
+
+struct mixed_matrix_t
+{
+    int32_t rows;
+    double matrix[rows][3];
+}
+

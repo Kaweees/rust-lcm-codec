@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
+use std::str::FromStr;
 
 /// Generate a single Rust file from a collection of LCM schema files.
 pub fn generate<P1: AsRef<Path>, SF: IntoIterator<Item = P1>, P2: AsRef<Path>>(
@@ -161,26 +162,26 @@ impl BaggageDimension {
 }
 
 fn to_underscored_literal(v: u64) -> proc_macro2::Literal {
-    use std::str::FromStr;
-    let raw = format!("{}", v);
-    let original_len = raw.len();
-    let mut s = String::with_capacity(original_len);
-    for (index, digit) in raw.chars().rev().enumerate() {
-        if index % 3 == 0 && index != 0 && index != original_len {
-            s.insert(0, '_')
-        }
-        s.insert(0, digit)
-    }
-    s.push_str("u64");
-    if let proc_macro2::TokenTree::Literal(l) = proc_macro2::TokenStream::from_str(&s)
-        .expect("Invalid underscored literal creation, failed lexing")
+    let s = if v >= 1_000_000 {
+        format!(
+            "{}_{:03}_{:03}u64",
+            v / 1_000_000,
+            (v / 1_000) % 1_000,
+            v % 1_000
+        )
+    } else if v >= 1_000 {
+        format!("{}_{:03}u64", v / 1_000, v % 1_000)
+    } else {
+        format!("{}u64", v)
+    };
+    match TokenStream::from_str(&s)
+        .unwrap()
         .into_iter()
         .next()
-        .expect("Should have made at least one token")
+        .unwrap()
     {
-        l
-    } else {
-        panic!("Created the wrong type of token when trying to make an underscored literal")
+        proc_macro2::TokenTree::Literal(l) => l,
+        _ => unreachable!(),
     }
 }
 
@@ -223,6 +224,27 @@ fn emit_struct(s: &parser::Struct, env: &Environment) -> TokenStream {
     let begin_write = format_ident!("begin_{}_write", s.name);
     let begin_read = format_ident!("begin_{}_read", s.name);
 
+    // Generate initializations for count fields if the first field is an array
+    let write_ready_count_init = if let Some((
+        parser::Field {
+            ty: parser::Type::Array(at),
+            name,
+        },
+        _,
+    )) = &codec_states[0].field
+    {
+        let current_count_field_ident = at
+            .array_current_count_field_ident(name.as_str(), 0)
+            .expect("Arrays must have at least one dimension");
+        Some(quote!(#current_count_field_ident: 0, ))
+    } else {
+        None
+    };
+    let read_ready_count_init = write_ready_count_init.clone();
+    let write_ready_baggage =
+        BaggageDimension::field_initializations_from_self(&codec_states[0].baggage_dimensions);
+    let read_ready_baggage = write_ready_baggage.clone();
+
     quote! {
         pub const #schema_hash_ident : u64 = #schema_hash;
 
@@ -232,7 +254,9 @@ fn emit_struct(s: &parser::Struct, env: &Environment) -> TokenStream {
                 writer.write_bytes(&#schema_hash.to_be_bytes())?;
 
                 Ok(#write_ready_type {
-                    writer
+                    writer,
+                    #write_ready_count_init
+                    #( #write_ready_baggage )*
                 })
             }
             #[inline]
@@ -246,7 +270,9 @@ fn emit_struct(s: &parser::Struct, env: &Environment) -> TokenStream {
                 }
 
                 Ok(#read_ready_type {
-                    reader
+                    reader,
+                    #read_ready_count_init
+                    #( #read_ready_baggage )*
                 })
             }
 
@@ -275,7 +301,6 @@ fn gather_states(s: &parser::Struct) -> Vec<CodecState> {
     );
 
     // Iterate backwards to collect and manage required dimensional metadata
-    // Note that the current approach does not handle multidimensional arrays
     let mut baggage_dimensions = Vec::new();
     for (i, member) in s.members.iter().enumerate().rev() {
         if let parser::StructMember::Field(f) = member {
@@ -292,19 +317,15 @@ fn gather_states(s: &parser::Struct) -> Vec<CodecState> {
                 }
             }
             baggage_dimensions.extend(local_dynamic_dimensions.clone());
-            if local_dynamic_dimensions.len() > 1 {
-                panic!("Arrays with more than one dimension are not yet supported");
-            }
             let mut field_serves_as_dimension = false;
-            while let Some(bi) = baggage_dimensions
-                .iter()
-                .position(|dim| dim.len_field_name == f.name.as_str())
-            {
-                // This dimension will be discharged by the transition out of this state, no need to
-                // keep tracking it
-                let bd = baggage_dimensions.remove(bi);
-                field_serves_as_dimension = true;
-            }
+            baggage_dimensions.retain(|dim| {
+                if dim.len_field_name == f.name.as_str() {
+                    field_serves_as_dimension = true;
+                    false
+                } else {
+                    true
+                }
+            });
             codec_states.insert(
                 0,
                 CodecState {
@@ -331,7 +352,7 @@ fn emit_writer_state_decl(ws: &CodecState, env: &Environment) -> TokenStream {
         None
     };
     let dimensions_fields = BaggageDimension::field_declarations(&ws.baggage_dimensions);
-    let (current_iter_count_field, array_item_writer_decl) = if let Some((
+    let current_iter_count_field = if let Some((
         parser::Field {
             ty: parser::Type::Array(at),
             name,
@@ -342,19 +363,9 @@ fn emit_writer_state_decl(ws: &CodecState, env: &Environment) -> TokenStream {
         let current_count_field_ident = at
             .array_current_count_field_ident(name.as_str(), 0)
             .expect("Arrays must have at least one dimension");
-        let item_writer_struct_ident = format_ident!("{}_item", struct_ident);
-        let array_item_writer_decl = quote! {
-            #[must_use]
-            pub struct #item_writer_struct_ident<'a, W: rust_lcm_codec::StreamingWriter> {
-                parent: &'a mut #struct_ident<'a, W>,
-            }
-        };
-        (
-            Some(quote!(#current_count_field_ident: usize, )),
-            Some(array_item_writer_decl),
-        )
+        Some(quote!(#current_count_field_ident: usize, ))
     } else {
-        (None, None)
+        None
     };
     let maybe_must_use = if ws.state_name != StateName::Done {
         Some(quote!(#[must_use]))
@@ -369,8 +380,6 @@ fn emit_writer_state_decl(ws: &CodecState, env: &Environment) -> TokenStream {
             #current_iter_count_field
             #( #dimensions_fields )*
         }
-
-        #array_item_writer_decl
     }
 }
 
@@ -382,7 +391,7 @@ fn emit_reader_state_decl(rs: &CodecState, env: &Environment) -> TokenStream {
         None
     };
     let dimensions_fields = BaggageDimension::field_declarations(&rs.baggage_dimensions);
-    let (current_iter_count_field, array_item_reader_decl) = if let Some((
+    let current_iter_count_field = if let Some((
         parser::Field {
             ty: parser::Type::Array(at),
             name,
@@ -393,19 +402,9 @@ fn emit_reader_state_decl(rs: &CodecState, env: &Environment) -> TokenStream {
         let current_count_field_ident = at
             .array_current_count_field_ident(name.as_str(), 0)
             .expect("Arrays must have at least one dimension");
-        let item_reader_struct_ident = format_ident!("{}_item", struct_ident);
-        let array_item_reader_decl = quote! {
-            #[must_use]
-            pub struct #item_reader_struct_ident<'a, R: rust_lcm_codec::StreamingReader> {
-                parent: &'a mut #struct_ident<'a, R>,
-            }
-        };
-        (
-            Some(quote!(#current_count_field_ident: usize, )),
-            Some(array_item_reader_decl),
-        )
+        Some(quote!(#current_count_field_ident: usize, ))
     } else {
-        (None, None)
+        None
     };
     let maybe_must_use = if rs.state_name != StateName::Done {
         Some(quote!(#[must_use]))
@@ -420,8 +419,6 @@ fn emit_reader_state_decl(rs: &CodecState, env: &Environment) -> TokenStream {
             #current_iter_count_field
             #( #dimensions_fields )*
         }
-
-        #array_item_reader_decl
     }
 }
 
@@ -463,12 +460,7 @@ fn emit_writer_state_transition(
                     f.name.as_str(),
                     st,
                 ),
-                parser::Type::Array(at) => emit_writer_field_state_transition_array(
-                    start_type,
-                    ws_next,
-                    f.name.as_str(),
-                    at,
-                ),
+                parser::Type::Array(at) => emit_array_logic(true, start_type, ws_next, f.name.as_str(), at),
             }
         }
         None => quote! {},
@@ -719,16 +711,59 @@ impl ArrayType {
         index: usize,
         use_parent: bool,
     ) -> Option<CountComparisonParts> {
+        self.array_current_count_vs_expected_at_depth(
+            array_field_name,
+            index,
+            if use_parent { 1 } else { 0 },
+        )
+    }
+
+    fn array_current_count_gte_expected_check_at_depth(
+        &self,
+        array_field_name: &str,
+        index: usize,
+        parent_depth: usize,
+    ) -> Option<TokenStream> {
+        self.array_current_count_vs_expected_at_depth(array_field_name, index, parent_depth)
+            .map(
+                |CountComparisonParts {
+                     current_count,
+                     expected_count,
+                 }| quote!(#current_count >= #expected_count ),
+            )
+    }
+
+    fn array_current_count_under_expected_check_at_depth(
+        &self,
+        array_field_name: &str,
+        index: usize,
+        parent_depth: usize,
+    ) -> Option<TokenStream> {
+        self.array_current_count_vs_expected_at_depth(array_field_name, index, parent_depth)
+            .map(
+                |CountComparisonParts {
+                     current_count,
+                     expected_count,
+                 }| quote!(#current_count < #expected_count ),
+            )
+    }
+
+    fn array_current_count_vs_expected_at_depth(
+        &self,
+        array_field_name: &str,
+        index: usize,
+        parent_depth: usize,
+    ) -> Option<CountComparisonParts> {
         let current_count_ident = self.array_current_count_field_ident(array_field_name, index)?;
-        let path_prefix = if use_parent {
-            quote!(self.parent)
-        } else {
-            quote!(self)
-        };
+        let mut path_prefix = quote!(self);
+        for _ in 0..parent_depth {
+            path_prefix = quote!(#path_prefix.parent);
+        }
+
         match self.dimensions.get(index) {
             Some(ArrayDimension::Static { size }) => Some(CountComparisonParts {
                 current_count: quote!(#path_prefix.#current_count_ident),
-                expected_count: quote!(#size),
+                expected_count: quote!(#size as usize),
             }),
             Some(ArrayDimension::Dynamic { field_name }) => {
                 let expected_count_ident = format_ident!("baggage_{}", field_name);
@@ -758,181 +793,126 @@ struct CountComparisonParts {
 ///
 /// If the array is over bytes, provide alternatives to iterating
 /// which allow direct slice operations.
-fn emit_writer_field_state_transition_array(
+fn emit_array_logic(
+    is_writer: bool,
     start_type: Ident,
     next_state: &CodecState,
     field_name: &str,
     at: &ArrayType,
 ) -> TokenStream {
-    let current_count_ident = at
-        .array_current_count_field_ident(field_name, 0)
-        .expect("Arrays should have at least one dimension");
-    let next_type = next_state.writer_ident();
-    let next_dimensions_fields =
-        BaggageDimension::field_initializations_from_self(&next_state.baggage_dimensions);
-    let item_writer_struct_ident = format_ident!("{}_item", start_type);
-    let write_item_method_ident = format_ident!("write");
+    let next_type = if is_writer { next_state.writer_ident() } else { next_state.reader_ident() };
+    let rw_field = if is_writer { quote!(writer) } else { quote!(reader) };
+    let rw_param = if is_writer { quote!(W) } else { quote!(R) };
+    let rw_trait = if is_writer { quote!(rust_lcm_codec::StreamingWriter) } else { quote!(rust_lcm_codec::StreamingReader) };
+    let err_type = if is_writer { quote!(EncodeValueError) } else { quote!(DecodeValueError) };
 
-    let item_writer_over_len_check = at
-        .array_current_count_gte_expected_check(field_name, 0, true)
-        .expect("Arrays should have at least one dimension");
-    let pre_field_write = Some(quote! {
-        if #item_writer_over_len_check {
-            return Err(rust_lcm_codec::EncodeValueError::ArrayLengthMismatch(
-                "array length mismatch discovered while iterating",
-            ));
-        }
-    });
-    let post_field_write = Some(quote! {
-        self.parent.#current_count_ident += 1;
-    });
-    let write_item_method = match &*at.item_type {
-        Type::Primitive(pt) => {
-            let maybe_ref = if *pt == PrimitiveType::String {
-                Some(quote!(&))
-            } else {
-                None
-            };
-            let rust_field_type = Some(format_ident!("{}", primitive_type_to_rust(&pt)));
-            let write_invocation = emit_write_primitive_invocation(*pt, WriterPath::ViaSelfParent);
-            quote! {
-                #[inline]
-                pub fn #write_item_method_ident(self, val: #maybe_ref #rust_field_type) -> Result<(), rust_lcm_codec::EncodeValueError<W::Error>> {
-                    #pre_field_write
-                    #write_invocation
-                    #post_field_write
-                    Ok(())
-                }
-            }
-        }
-        Type::Struct(st) => {
-            let after_field_type = quote!(()); // unit
-            let after_field_constructor = quote!(()); // unit instantiation looks like its typedef
-            emit_write_struct_method(
-                st,
-                write_item_method_ident,
-                pre_field_write,
-                post_field_write,
-                after_field_type,
-                after_field_constructor,
-                WriterPath::ViaSelfParent,
-            )
-        }
-        Type::Array(at) => panic!("Multidimensional arrays are not supported yet."),
+    let current_count_ident = at.array_current_count_field_ident(field_name, 0).expect("Arrays should have at least one dimension");
+    let top_level_under_len_check = at.array_current_count_under_expected_check(field_name, 0, false).expect("Arrays should have at least one dimension");
+    let current_iter_count_initialization = emit_next_field_current_iter_count_initialization(next_state);
+    let next_dimensions_fields = BaggageDimension::field_initializations_from_self(&next_state.baggage_dimensions);
+
+    let item_struct_ident = format_ident!("{}_item", start_type);
+    let (item_structure, extra_code) = emit_recursive_array(start_type.clone(), field_name, at, 1, is_writer);
+
+    let nested_count_initialization = if at.dimensions.len() > 1 {
+         let id = at.array_current_count_field_ident(field_name, 1).expect("Nested arrays must have at least one more dimension");
+        Some(quote!(#id: 0, ))
+    } else {
+        None
     };
 
-    let current_iter_count_initialization =
-        emit_next_field_current_iter_count_initialization(next_state);
-    let top_level_under_len_check = at
-        .array_current_count_under_expected_check(field_name, 0, false)
-        .expect("Arrays should have at least one dimension");
-
-    let (maybe_slice_writer_methods, maybe_slice_writer_outcome_definition) = match &*at.item_type {
-        Type::Primitive(PrimitiveType::Byte) => {
-            let remainder_value = at.array_current_count_remainder_value(field_name, 0, false);
-            let copy_field_from_slice_ident = format_ident!("{}_copy_from_slice", field_name);
-            let get_field_as_mut_slice_ident = format_ident!("{}_as_mut_slice", field_name);
-            let slice_writer_outcome_type_ident = format_ident!("{}AsMutSliceOutcome", field_name);
-            let slice_writer_outcome_type_definition = quote! {
-                type #slice_writer_outcome_type_ident<'a, W> = (&'a mut [core::mem::MaybeUninit<u8>], #next_type<'a, W>);
-            };
+    let (maybe_slice_methods, maybe_slice_outcome) = if let Type::Primitive(PrimitiveType::Byte) = &*at.item_type {
+        let remainder = at.array_current_count_remainder_value(field_name, 0, false);
+        if is_writer {
+            let copy_ident = format_ident!("{}_copy_from_slice", field_name);
+            let mut_slice_ident = format_ident!("{}_as_mut_slice", field_name);
+            let outcome_ident = format_ident!("{}AsMutSliceOutcome", field_name);
             (
                 Some(quote! {
-                #[inline]
-                pub fn #copy_field_from_slice_ident(self, val: &[u8]) -> Result<#next_type<'a, W>, rust_lcm_codec::EncodeValueError<W::Error>> {
-                    if #remainder_value != val.len() {
-                        Err(rust_lcm_codec::EncodeValueError::ArrayLengthMismatch(
-                            "slice provided to copy_FIELD_from_slice had a length which did not match the remaining expected size of the array",
-                        ))
-                    } else {
-                        self.writer.write_bytes(val)?;
-                        Ok(#next_type {
-                            writer: self.writer,
-                            #current_iter_count_initialization
-                            #( #next_dimensions_fields )*
-                        })
+                    #[inline]
+                    pub fn #copy_ident(self, val: &[u8]) -> Result<#next_type<'a, W>, rust_lcm_codec::EncodeValueError<W::Error>> {
+                        if #remainder != val.len() {
+                            Err(rust_lcm_codec::EncodeValueError::ArrayLengthMismatch("slice length mismatch"))
+                        } else {
+                            self.writer.write_bytes(val)?;
+                            Ok(#next_type { writer: self.writer, #current_iter_count_initialization #( #next_dimensions_fields )* })
+                        }
                     }
-                }
-                /// This method exposes the underlying writer's raw bytes for a region of size equal
-                /// to the previously-written array length field value (minus any values already written
-                /// via iteration).  This provides a mechanism
-                /// for doing direct operations into byte blob style fields without extraneous copies,
-                ///
-                /// Since we don't know anything about the underlying writer's bytes preceding content,
-                /// return the bytes with a type hint showing they may be uninitialized.
-                /// In implementations where the writer's backing storage mechanism is understood by the
-                /// user (e.g. backed by a previously initialized array buffer), it may be safe to
-                /// transmute the slice to a plain byte slice.
-                #[inline]
-                pub fn #get_field_as_mut_slice_ident(self) -> Result<#slice_writer_outcome_type_ident<'a, W>, rust_lcm_codec::EncodeValueError<W::Error>> {
+                    /// This method exposes the underlying writer's raw bytes for a region of size equal
+                    /// to the previously-written array length field value (minus any values already written
+                    /// via iteration).  This provides a mechanism
+                    /// for doing direct operations into byte blob style fields without extraneous copies,
+                    ///
+                    /// Since we don't know anything about the underlying writer's bytes preceding content,
+                    /// return the bytes with a type hint showing they may be uninitialized.
+                    /// In implementations where the writer's backing storage mechanism is understood by the
+                    /// user (e.g. backed by a previously initialized array buffer), it may be safe to
+                    /// transmute the slice to a plain byte slice.
+                    #[inline]
+                    pub fn #mut_slice_ident(self) -> Result<#outcome_ident<'a, W>, rust_lcm_codec::EncodeValueError<W::Error>> {
                         // Use transmute to help link the generated bytes reference to the underlying Writer's lifetime
                         //
                         // Here we depend on the documented invariant of share_bytes_mut wherein the Writer
                         // promises not to allow itself to mutate the shared bytes at any point in the future.
-                        let shared_bytes = unsafe { core::mem::transmute(self.writer.share_bytes_mut(#remainder_value)?) };
-                        Ok((shared_bytes,
-                            #next_type {
-                                writer: self.writer,
-                                #current_iter_count_initialization
-                                #( #next_dimensions_fields )*
-                            }))
-                }
+                        let shared_bytes = unsafe { core::mem::transmute(self.writer.share_bytes_mut(#remainder)?) };
+                        Ok((shared_bytes, #next_type { writer: self.writer, #current_iter_count_initialization #( #next_dimensions_fields )* }))
+                    }
                 }),
-                Some(slice_writer_outcome_type_definition),
+                Some(quote!(type #outcome_ident<'a, W> = (&'a mut [core::mem::MaybeUninit<u8>], #next_type<'a, W>);))
+            )
+        } else {
+            let as_slice_ident = format_ident!("{}_as_slice", field_name);
+            let outcome_ident = format_ident!("{}AsSliceOutcome", field_name);
+            (
+                Some(quote! {
+                    /// This method exposes the underlying reader's raw bytes for a region of size equal
+                    /// to the previously-written array length field value (minus any values
+                    /// previously read through iteration).  This provides a mechanism
+                    /// for doing direct operations from byte blob style fields without extraneous copies,
+                    #[inline]
+                    pub fn #as_slice_ident(self) -> Result<#outcome_ident<'a, R>, rust_lcm_codec::DecodeValueError<R::Error>> {
+                        // Use transmute to help link the generated bytes reference to the underlying Reader's lifetime
+                        //
+                        // Here we depend on the documented invariant of share_bytes wherein the Reader
+                        // promises not to allow itself to mutate the shared bytes at any point in the future.
+                        let shared_bytes = unsafe { core::mem::transmute(self.reader.share_bytes(#remainder)?) };
+                        Ok((shared_bytes, #next_type { reader: self.reader, #current_iter_count_initialization #( #next_dimensions_fields )* }))
+                    }
+                }),
+                Some(quote!(type #outcome_ident<'a, R> = (&'a [u8], #next_type<'a, R>);))
             )
         }
-        _ => (None, None),
-    };
+    } else { (None, None) };
+
     // TODO - create location-specific error message for array length mismatch
     quote! {
-
-        impl<'a, W: rust_lcm_codec::StreamingWriter> Iterator for #start_type<'a, W> {
-            type Item = #item_writer_struct_ident<'a, W>;
+        impl<'a, #rw_param: #rw_trait> Iterator for #start_type<'a, #rw_param> {
+            type Item = #item_struct_ident<'a, #rw_param>;
             fn next(&mut self) -> Option<Self::Item> {
                 if #top_level_under_len_check {
-                    // We cheat here to allow normally-evil multiple parent-mutable
-                    // references because we know that the generated code in the
-                    // child acts on the parent in a convergent manner:
-                    // * Each child consumes itself when it exercises its only method,
-                    //   and is thus limited to a single shot at mutating the parent.
-                    // * The child mutation of the parent is gated on boundary checks in the parent
-                    //   (max child operations and the underlying writer bounds checks)
-                    unsafe {
-                        Some(#item_writer_struct_ident {
-                            parent: core::mem::transmute(self),
-                        })
-                    }
-                } else {
-                    None
-                }
+                    self.#current_count_ident += 1;
+                    unsafe { Some(#item_struct_ident { parent: core::mem::transmute(self), #nested_count_initialization }) }
+                } else { None }
             }
         }
-        impl<'a, W: rust_lcm_codec::StreamingWriter> #item_writer_struct_ident<'a, W> {
+        impl<'a, #rw_param: #rw_trait> #item_struct_ident<'a, #rw_param> { #item_structure }
+        #maybe_slice_outcome
+        impl<'a, #rw_param: #rw_trait> #start_type<'a, #rw_param> {
+            #maybe_slice_methods
             #[inline]
-            #write_item_method
-        }
-
-        #maybe_slice_writer_outcome_definition
-
-        impl<'a, W: rust_lcm_codec::StreamingWriter> #start_type<'a, W> {
-
-            #maybe_slice_writer_methods
-
-            #[inline]
-            pub fn done(self) -> Result<#next_type<'a, W>, rust_lcm_codec::EncodeValueError<W::Error>> {
+            pub fn done(self) -> Result<#next_type<'a, #rw_param>, rust_lcm_codec::#err_type<#rw_param::Error>> {
                 if #top_level_under_len_check {
-                    Err(rust_lcm_codec::EncodeValueError::ArrayLengthMismatch(
-                        "array length mismatch discovered when `done` called",
-                    ))
+                    Err(rust_lcm_codec::#err_type::ArrayLengthMismatch("array length mismatch in done()"))
                 } else {
                     Ok(#next_type {
-                        writer: self.writer,
+                        #rw_field: self.#rw_field,
                         #current_iter_count_initialization
                         #( #next_dimensions_fields )*
                     })
                 }
             }
         }
+        #extra_code
     }
 }
 
@@ -1038,171 +1018,98 @@ fn emit_reader_state_transition(
                         }
                     }
                 }
-                Type::Array(at) => {
-                    let read_method_ident = format_ident!("read");
-                    let current_iter_count_field_ident = at
-                        .array_current_count_field_ident(f.name.as_str(), 0)
-                        .expect("Arrays should have at least one dimension");
-                    let item_reader_over_len_check = at
-                        .array_current_count_gte_expected_check(f.name.as_str(), 0, true)
-                        .expect("Arrays should have at least one dimension");
-                    let pre_field_read = quote! {
-                        if #item_reader_over_len_check {
-                            return Err(rust_lcm_codec::DecodeValueError::ArrayLengthMismatch(
-                                "array length mismatch discovered while iterating to read",
-                            ));
-                        }
-                    };
-                    let post_field_read = quote!(self.parent.#current_iter_count_field_ident += 1;);
-                    let read_item_method = match &*at.item_type {
-                        Type::Primitive(pt) => {
-                            let rust_field_type = format_ident!("{}", primitive_type_to_rust(pt));
-                            match pt {
-                                PrimitiveType::String => quote! {
-                                    pub fn #read_method_ident(self) -> Result<&'a #rust_field_type, rust_lcm_codec::DecodeValueError<R::Error>> {
-                                        #pre_field_read
-                                        // Use transmute to link the generated string reference to the underlying Reader's lifetime
-                                        let v = unsafe { core::mem::transmute(rust_lcm_codec::read_str_value(self.parent.reader)?) };
-                                        #post_field_read
-                                        Ok(v)
-                                    }
-                                },
-                                _ => quote! {
-                                    pub fn #read_method_ident(self) -> Result<#rust_field_type, rust_lcm_codec::DecodeValueError<R::Error>> {
-                                        #pre_field_read
-                                        let v = rust_lcm_codec::SerializeValue::read_value(self.parent.reader)?;
-                                        #post_field_read
-                                        Ok(v)
-                                    }
-                                },
-                            }
-                        }
-
-                        Type::Struct(st) => {
-                            let struct_ns_prefix = st.namespace_prefix();
-                            let field_struct_read_ready: Ident =
-                                CodecState::reader_struct_state_decl_ident(
-                                    &st.name,
-                                    &StateName::Ready,
-                                );
-                            let field_struct_read_done: Ident =
-                                CodecState::reader_struct_state_decl_ident(
-                                    &st.name,
-                                    &StateName::Done,
-                                );
-                            quote! {
-                                pub fn #read_method_ident<F>(self, f: F) -> Result<(), rust_lcm_codec::DecodeValueError<R::Error>>
-                                    where F: FnOnce(#struct_ns_prefix#field_struct_read_ready<'a, R>) -> Result<#struct_ns_prefix#field_struct_read_done<'a, R>, rust_lcm_codec::DecodeValueError<R::Error>>
-                                {
-                                    #pre_field_read
-                                    let ready = #struct_ns_prefix#field_struct_read_ready {
-                                        reader: self.parent.reader,
-                                    };
-                                    let _done = f(ready)?;
-                                    #post_field_read
-                                    Ok(())
-                                }
-                            }
-                        }
-                        Type::Array(at) => panic!("Multidimensional arrays are not supported yet."),
-                    };
-                    let item_reader_struct_ident = format_ident!("{}_item", start_type);
-                    let read_item_method_ident = format_ident!("read");
-                    let top_level_under_len_check = at
-                        .array_current_count_under_expected_check(f.name.as_str(), 0, false)
-                        .expect("Arrays should have at least one dimension");
-                    let (maybe_slice_reader_method, maybe_slice_reader_outcome_type) = match &*at
-                        .item_type
-                    {
-                        Type::Primitive(PrimitiveType::Byte) => {
-                            let field_name = f.name.as_str();
-                            let remainder_value =
-                                at.array_current_count_remainder_value(field_name, 0, false);
-                            let get_field_as_slice_ident = format_ident!("{}_as_slice", field_name);
-                            let slice_reader_outcome_type_ident =
-                                format_ident!("{}AsSliceOutcome", field_name);
-                            let slice_reader_outcome_type_definition = quote! {
-                                type #slice_reader_outcome_type_ident<'a, R> = (&'a [u8], #next_type<'a, R>);
-                            };
-                            (
-                                Some(quote! {
-                                /// This method exposes the underlying reader's raw bytes for a region of size equal
-                                /// to the previously-written array length field value (minus any values
-                                /// previously read through iteration).  This provides a mechanism
-                                /// for doing direct operations from byte blob style fields without extraneous copies,
-                                #[inline]
-                                pub fn #get_field_as_slice_ident(self) -> Result<#slice_reader_outcome_type_ident<'a, R>, rust_lcm_codec::DecodeValueError<R::Error>> {
-                                        // Use transmute to help link the generated bytes reference to the underlying Reader's lifetime
-                                        //
-                                        // Here we depend on the documented invariant of share_bytes wherein the Reader
-                                        // promises not to allow itself to mutate the shared bytes at any point in the future.
-                                        let shared_bytes = unsafe { core::mem::transmute(self.reader.share_bytes(#remainder_value)?) };
-                                        Ok((shared_bytes,
-                                            #next_type {
-                                                reader: self.reader,
-                                                #current_iter_count_initialization
-                                                #( #next_dimensions_fields )*
-                                            }))
-                                }
-                                }),
-                                Some(slice_reader_outcome_type_definition),
-                            )
-                        }
-                        _ => (None, None),
-                    };
-                    quote! {
-                        impl<'a, R: rust_lcm_codec::StreamingReader> Iterator for #start_type<'a, R> {
-                            type Item = #item_reader_struct_ident<'a, R>;
-                            fn next(&mut self) -> Option<Self::Item> {
-                                if #top_level_under_len_check {
-                                    // We cheat here to allow normally-evil multiple parent-mutable
-                                    // references because we know that the generated code in the
-                                    // child acts on the parent in a convergent manner:
-                                    // * Each child consumes itself when it exercises its only method,
-                                    //   and is thus limited to a single shot at mutating the parent.
-                                    // * The child mutation of the parent is gated on boundary checks in the parent
-                                    //   (max child operations and the underlying reader bounds checks)
-                                    unsafe {
-                                        Some(#item_reader_struct_ident {
-                                            parent: core::mem::transmute(self),
-                                        })
-                                    }
-                                } else {
-                                    None
-                                }
-                            }
-                        }
-                        impl<'a, R: rust_lcm_codec::StreamingReader> #item_reader_struct_ident<'a, R> {
-                            #[inline]
-                            #read_item_method
-                        }
-
-                        #maybe_slice_reader_outcome_type
-
-                        impl<'a, R: rust_lcm_codec::StreamingReader> #start_type<'a, R> {
-                            #[inline]
-                            pub fn done(self) -> Result<#next_type<'a, R>, rust_lcm_codec::DecodeValueError<R::Error>> {
-                                if #top_level_under_len_check {
-                                    Err(rust_lcm_codec::DecodeValueError::ArrayLengthMismatch(
-                                        "array length mismatch discovered when read `done` called",
-                                    ))
-                                } else {
-                                    Ok(#next_type {
-                                        reader: self.reader,
-                                        #current_iter_count_initialization
-                                        #( #next_dimensions_fields )*
-                                    })
-                                }
-                            }
-
-                            #maybe_slice_reader_method
-                        }
-                    }
-                }
+                Type::Array(at) => emit_array_logic(false, start_type, next_state, f.name.as_str(), at),
             }
         }
         None => quote! {},
     }
+}
+
+fn emit_recursive_array(
+    parent_ident: Ident,
+    field_name: &str,
+    at: &ArrayType,
+    depth: usize,
+    is_writer: bool,
+) -> (TokenStream, TokenStream) {
+    let ident = format_ident!("{}_item", parent_ident);
+    let mut root = quote!(self);
+    for _ in 0..depth { root = quote!(#root.parent); }
+    let rw_param = if is_writer { quote!(W) } else { quote!(R) };
+    let rw_trait = if is_writer { quote!(StreamingWriter) } else { quote!(StreamingReader) };
+    let rw_bound = quote!(#rw_param: rust_lcm_codec::#rw_trait);
+
+    if depth >= at.dimensions.len() {
+        let (method, err) = if is_writer {
+            let (m, e) = match &*at.item_type {
+                Type::Primitive(pt) => {
+                    let rust_type = format_ident!("{}", primitive_type_to_rust(pt));
+                    let (r, inv) = match pt {
+                        PrimitiveType::String => (quote!(&), quote!(rust_lcm_codec::write_str_value(val, #root.writer))),
+                        _ => (quote!(), quote!(rust_lcm_codec::SerializeValue::write_value(val, #root.writer)))
+                    };
+                    (quote!(#[inline] pub fn write(self, val: #r #rust_type) -> Result<(), rust_lcm_codec::EncodeValueError<W::Error>> { #inv?; Ok(()) }), quote!(EncodeValueError))
+                }
+                Type::Struct(st) => {
+                    let ready = CodecState::writer_struct_state_decl_ident(&st.name, &StateName::Ready);
+                    let done = CodecState::writer_struct_state_decl_ident(&st.name, &StateName::Done);
+                    let ns = st.namespace_prefix();
+                    (quote!(#[inline] pub fn write<F>(self, f: F) -> Result<(), rust_lcm_codec::EncodeValueError<W::Error>> where F: FnOnce(#ns#ready<'a, W>) -> Result<#ns#done<'a, W>, rust_lcm_codec::EncodeValueError<W::Error>> { f(#ns#ready { writer: #root.writer })?; Ok(()) }), quote!(EncodeValueError))
+                }
+                _ => panic!("Unsupported")
+            };
+            (m, e)
+        } else {
+            let (m, e) = match &*at.item_type {
+                Type::Primitive(pt) => {
+                    let rust_type = format_ident!("{}", primitive_type_to_rust(pt));
+                    let (ret, inv) = if pt == &PrimitiveType::String {
+                        (quote!(&'a #rust_type), quote!(Ok(unsafe { core::mem::transmute(rust_lcm_codec::read_str_value(#root.reader)?) })))
+                    } else {
+                        (quote!(#rust_type), quote!(rust_lcm_codec::SerializeValue::read_value(#root.reader)))
+                    };
+                    (quote!(pub fn read(self) -> Result<#ret, rust_lcm_codec::DecodeValueError<R::Error>> { #inv }), quote!(DecodeValueError))
+                }
+                Type::Struct(st) => {
+                    let ready = CodecState::reader_struct_state_decl_ident(&st.name, &StateName::Ready);
+                    let done = CodecState::reader_struct_state_decl_ident(&st.name, &StateName::Done);
+                    let ns = st.namespace_prefix();
+                    (quote!(#[inline] pub fn read<F>(self, f: F) -> Result<(), rust_lcm_codec::DecodeValueError<R::Error>> where F: FnOnce(#ns#ready<'a, R>) -> Result<#ns#done<'a, R>, rust_lcm_codec::DecodeValueError<R::Error>> { f(#ns#ready { reader: #root.reader })?; Ok(()) }), quote!(DecodeValueError))
+                }
+                _ => panic!("Unsupported")
+            };
+            (m, e)
+        };
+        return (method, quote!(#[must_use] pub struct #ident<'a, #rw_bound> { parent: &'a mut #parent_ident<'a, #rw_param> }));
+    }
+
+    let next_ident = format_ident!("{}_item", ident);
+    let (next_structure, next_extra) = emit_recursive_array(ident.clone(), field_name, at, depth + 1, is_writer);
+    let count_ident = at.array_current_count_field_ident(field_name, depth).unwrap();
+    let check = match at.dimensions.get(depth).unwrap() {
+        ArrayDimension::Static { size } => quote!(self.#count_ident < #size as usize),
+        ArrayDimension::Dynamic { field_name } => {
+            let bag = format_ident!("baggage_{}", field_name);
+            quote!(self.#count_ident < #root.#bag)
+        }
+    };
+    let next_init = at.array_current_count_field_ident(field_name, depth + 1).map(|id| quote!(#id: 0,));
+
+    (quote! {}, quote! {
+        #[must_use]
+        pub struct #ident<'a, #rw_bound> { parent: &'a mut #parent_ident<'a, #rw_param>, #count_ident: usize }
+        impl<'a, #rw_bound> Iterator for #ident<'a, #rw_param> {
+            type Item = #next_ident<'a, #rw_param>;
+            fn next(&mut self) -> Option<Self::Item> {
+                if #check {
+                    self.#count_ident += 1;
+                    unsafe { Some(#next_ident { parent: core::mem::transmute(self), #next_init }) }
+                } else { None }
+            }
+        }
+        impl<'a, #rw_bound> #next_ident<'a, #rw_param> { #next_structure }
+        #next_extra
+    })
 }
 
 /// Collection of a schema and its peers.

@@ -16,6 +16,7 @@ fn main() {
         "../schemas/single_dimension_list.lcm",
         "../schemas/nested_list.lcm",
         "../schemas/sliceable_list.lcm",
+        "../schemas/multidimensional.lcm",
     ];
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR");
     let out_path = Path::join(Path::new(&out_dir), "generated_lcm_api.rs");
