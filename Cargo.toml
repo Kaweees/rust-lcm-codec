@@ -1,18 +1,19 @@
 [package]
-name = "rust-lcm-codec"
-version = "0.2.1"
+name = "rust-lcm-codec-dimos"
+version = "0.2.3"
 edition = "2018"
-authors = ["Russell Mull <russell@auxon.io>", "Zack Pierce <zack@auxon.io>"]
+authors = [
+  "Russell Mull <russell@auxon.io>",
+  "Zack Pierce <zack@auxon.io>",
+  "Miguel Villa Floran <miguel.villafloran@gmail.com>",
+]
 license = "Apache-2.0"
 repository = "https://github.com/auxoncorp/rust-lcm-codec"
 readme = "README.md"
 description = "Rust support for reading and writing the LCM data format"
 
 [workspace]
-members = [
-    "tests/generated",
-    "rust-lcm-codegen",
-]
+members = ["tests/generated", "rust-lcm-codegen"]
 
 [dependencies]
 

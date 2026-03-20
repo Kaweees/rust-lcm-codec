@@ -18,7 +18,7 @@ data definitions/schemas by [rust-lcm-codegen](./rust-lcm-codegen/README.md).
 - [x] Minimize performance costs of de/serialization.
 - [x] Maximize de/serialization correctness through use of session types.
 - [x] No rustc or clippy warnings in generated code.
-- [ ] Support multidimensional arrays.
+- [x] Support multidimensional arrays.
 - [ ] Rigorously test for cross-implementation compatibility.
 
 ## Getting Started

@@ -11,7 +11,7 @@ name = "generated"
 path = "lib.rs"
 
 [dependencies]
-rust-lcm-codec = { path = "../../" }
+rust-lcm-codec = { path = "../../", package = "rust-lcm-codec-dimos" }
 
 [build-dependencies]
 rust-lcm-codegen = { path = "../../rust-lcm-codegen" }
